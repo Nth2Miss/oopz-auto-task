@@ -1,6 +1,6 @@
-# Oopz 自动签到 · 每日任务
+# Oopz 自动签到 · 每日星辉任务
 
-一键完成 Oopz 每日签到与社区任务，支持服务器无人值守定时运行。
+一键完成 Oopz 每日签到与社区星辉任务，支持服务器无人值守定时运行。
 
 <img src="https://img.shields.io/badge/Python-3.7%2B-3776ab?logo=python&logoColor=white" alt="Python 3.7+">
 <img src="https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen" alt="dependencies: stdlib only">
