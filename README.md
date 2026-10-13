@@ -119,7 +119,7 @@ python oopz_sign.py sign
 
 ```bash
 # 每天 8:30 执行签到 + 全部每日任务 + 领奖
-30 8 * * * cd /path/to/oopz-auto-task && python3 oopz_sign.py sign && sleep 5 && python3 oopz_sign.py tasks >> oopz_sign.log 2>&1
+30 8 * * * cd /path/to/oopz-auto-task && python3 oopz_sign.py sign >> oopz_sign.log 2>&1 && sleep 5 python3 oopz_sign.py tasks >> oopz_sign.log 2>&1
 ```
 
 ### Windows（任务计划程序）
