@@ -298,11 +298,9 @@ STATUS_CANDIDATES = [
     ("/task/v1/detail", "GET", None),
 ]
 SIGNIN_CANDIDATES = [
-    ("/user_points/v1/sign_in", "POST", {}),
-    ("/client/v1/user_points/v1/sign_in", "POST", {}),
-    ("/user_points/v1/sign_in", "GET", None),
+    # 每日签到（星辉）唯一真实接口。实测 /user_points/v1/sign_in 是空接口：
+    # 永远返回 {"status":true,"data":true} 但服务端不记账（签到日历不变），已弃用
     ("/task/v1/signIn", "POST", {}),
-    ("/client/v1/task/v1/signIn", "POST", {}),
 ]
 # 每日任务相关（笔记）
 TASK_CANDIDATES = {
@@ -398,6 +396,10 @@ def cmd_probe(client):
 
 def cmd_check(client):
     print("[*] 查询状态 ...")
+    info = _signin_state(client)
+    if info:
+        num, today = info
+        print(f"    [签到] 今日{'已' if today else '未'}签到，连续签到 {num} 天")
     for p, m, b in STATUS_CANDIDATES:
         st, raw = client.request(p, m, b)
         print("  " + client.describe(st, raw))
@@ -406,22 +408,46 @@ def cmd_check(client):
     return None
 
 
+def _signin_state(client):
+    """读取每日签到状态，返回 (连续签到天数, 今日是否已签到)；读取失败返回 None"""
+    st, raw = client.request("/task/v1/detail", "GET")
+    if not client.ok(st, raw):
+        return None
+    try:
+        s = (json.loads(raw).get("data") or {}).get("signInEveryDay") or {}
+        if not s:
+            return None
+        return s.get("signInNum", 0), bool(s.get("isTodaySignIn"))
+    except Exception:
+        return None
+
+
 def cmd_sign(client):
     print("[*] 执行签到 ...")
     for p, m, b in SIGNIN_CANDIDATES:
         st, raw = client.request(p, m, b)
         print("  " + client.describe(st, raw))
-        if client.ok(st, raw):
-            log(f"签到成功 [{m} {p}]")
-            print(f"[+] 签到成功：{m} {p}")
-            return True
         if st == 428:
             log("签到失败: token 失效")
             print("[!] token 失效，请重新 login")
             return False
+        # 已签到（幂等）：{"status":true,"data":null,"message":"今日已签到"}
         if st == 200 and any(h in raw for h in ALREADY_HINTS):
             log(f"今日已签到 [{m} {p}]")
             print("[=] 今日已经签到过了")
+            return True
+        # 签到成功：{"status":true,"data":{"awardType":"DIAMOND","awardNum":5},...}；
+        # data 为 null 不算成功，避免空接口误报
+        if client.ok(st, raw) and '"data":null' not in raw.replace(" ", ""):
+            log(f"签到成功 [{m} {p}]")
+            print(f"[+] 签到成功：{m} {p}")
+            info = _signin_state(client)
+            if info:
+                num, today = info
+                print(f"    已确认：今日{'已' if today else '仍未'}签到，连续签到 {num} 天")
+                if not today:
+                    print("[!] 服务端签到状态未更新，请稍后重试")
+                    return False
             return True
     log("签到未成功")
     print("[!] 未签到成功，可运行 probe 查看各接口真实响应")
@@ -515,18 +541,14 @@ def _fetch_feed(client, n=12):
 
 
 def _upload_image(client, data=None, filename="a.png", content_type="image/png"):
-    """presign 上传图片到 COS。data 为空时上传 1x1 占位 PNG。返回资源 URL"""
+    """presign 上传图片到 COS。data 为空时上传 1x1 占位 PNG。
+
+    返回资源 URL。注意必须保留 hostUrl 上的 CDN 签名（?sign=...）——
+    发布接口校验资源地址，去掉签名的地址会报「上传类型错误」。
+    """
     import struct
     import zlib
 
-    st, raw = client.request("/v1/upload/getCommunityImagePreSignUrl", "POST",
-                             {"fileName": filename, "contentType": content_type})
-    if not client.ok(st, raw):
-        return None
-    up = (json.loads(raw).get("data") or {})
-    put_url = up.get("url")
-    if not put_url:
-        return None
     if data is None:
         def chunk(t, d):
             cc = t + d
@@ -535,23 +557,35 @@ def _upload_image(client, data=None, filename="a.png", content_type="image/png")
                 + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
                 + chunk(b"IDAT", zlib.compress(b"\x00\xff\xff\xff"))
                 + chunk(b"IEND", b""))
-    try:
-        req = urllib.request.Request(put_url, data=data, method="PUT",
-                                     headers={"Content-Type": content_type})
-        urllib.request.urlopen(req, timeout=60)
-    except Exception:
-        return None
-    path = up.get("path") or urllib.parse.unquote(urllib.parse.urlparse(put_url).path)
-    # hostUrl 是完整资源地址（含 path）；host 字段可能缺失，从 put_url 域名兜底
-    if "hostUrl" in up and up.get("hostUrl"):
-        host = up["hostUrl"].split("?")[0]          # 完整 URL（不含签名 query）
-    else:
+
+    for _ in range(2):                      # 预签名 URL 有效期 3 分钟，过期就重新申请
+        st, raw = client.request("/v1/upload/getCommunityImagePreSignUrl", "POST",
+                                 {"fileName": filename, "contentType": content_type})
+        if not client.ok(st, raw):
+            return None
+        up = (json.loads(raw).get("data") or {})
+        put_url = up.get("url")
+        if not put_url:
+            return None
+        for _ in range(3):                  # 上传偶发网络抖动，重试几次
+            try:
+                req = urllib.request.Request(put_url, data=data, method="PUT",
+                                             headers={"Content-Type": content_type})
+                urllib.request.urlopen(req, timeout=120)
+                break
+            except Exception:
+                time.sleep(1.5)
+        else:
+            continue
+        # hostUrl 是完整资源地址（含 path 与 sign 签名参数，发布时原样带上）
+        if up.get("hostUrl"):
+            return up["hostUrl"]
+        path = up.get("path") or urllib.parse.unquote(urllib.parse.urlparse(put_url).path)
         origin = urllib.parse.urlparse(put_url)
-        host = f"{origin.scheme}://{origin.netloc}"
         if not path.startswith("/"):
             path = "/" + path
-        host += path
-    return host
+        return f"{origin.scheme}://{origin.netloc}{path}"
+    return None
 
 
 def _publish_note(client, title, content, bing_info=None):
@@ -573,8 +607,10 @@ def _publish_note(client, title, content, bing_info=None):
         "groupType": "article",
         "title": title,
         "content": content,
-        "resources": [{"cover": res, "resource": res,
-                       "resourceType": "IMAGE", "height": w and h or 1, "width": w or 1}],
+        # 资源字段名必须是 imageList（驼峰，实测 APP 端结构）；
+        # 写成 resources / image_list 会被忽略并返回「上传类型错误」
+        "imageList": [{"cover": res, "resource": res, "resourceType": "IMAGE",
+                       "sourceResource": "", "height": w and h or 1, "width": w or 1}],
     }
     st, raw = client.request("/community/v1/publish", "POST", body)
     ok = client.ok(st, raw)
@@ -650,29 +686,34 @@ def cmd_tasks(client):
     share_ok = client.ok(st, raw)
     print(f"  分享: {client.describe(st, raw)}")
 
-    # 5) 发布 1 篇（20 字以上正文 + 图）
+    # 5) 发布 1 篇（20 字以上正文 + 图）—— 当天已完成就跳过，避免重复发帖
     #    正文：一言 API 拼接；配图：必应每日一图。
-    #    发布偶发"上传类型错误"（当日发布任务完成后服务端限制，次日自动恢复），失败重试一次
-    import random
-    title = random.choice(PUBLISH_TITLES)
-    note_content, sources = build_note_content()
-    if len(note_content) < 20:
-        note_content += "\n今日打卡，顺便记录一下游戏日常！"
-    bing = _bing_daily_image()
-    if bing:
-        bing_title = (bing[3].get("title") or "").strip()
-        if bing_title and bing_title not in title:
-            title = f"{title}｜{bing_title}"
-        if sources:
-            note_content += f"\n\n—— 摘自{'、'.join(sources[:2])}"
-        note_content += f"\n\n配图：今日必应每日一图 · {bing[3].get('copyright', '')}"
-    print(f"  发布: 《{title}》（正文 {len(note_content)} 字，配图 {'必应每日一图' if bing else '占位图'}）")
-    publish_ok = _publish_note(client, title, note_content, bing_info=bing)
-    if not publish_ok:
-        time.sleep(3)
-        print("  发布: 重试一次 ...")
-        note_content2 = note_content + "\n补充：祝大家周末愉快，把把超神！"
-        publish_ok = _publish_note(client, title, note_content2, bing_info=bing)
+    #    "上传类型错误"根因是资源字段名（须为 imageList）与 URL 签名（须保留
+    #    hostUrl 的 ?sign= 参数），已修复；仍保留一次重试覆盖偶发网络抖动
+    pub_done = (before.get(9) or (None, None, 0))[2] != 0
+    if pub_done:
+        print("\n  发布: 今日已完成，跳过")
+    else:
+        import random
+        title = random.choice(PUBLISH_TITLES)
+        note_content, sources = build_note_content()
+        if len(note_content) < 20:
+            note_content += "\n今日打卡，顺便记录一下游戏日常！"
+        bing = _bing_daily_image()
+        if bing:
+            bing_title = (bing[3].get("title") or "").strip()
+            if bing_title and bing_title not in title:
+                title = f"{title}｜{bing_title}"
+            if sources:
+                note_content += f"\n\n—— 摘自{'、'.join(sources[:2])}"
+            note_content += f"\n\n配图：今日必应每日一图 · {bing[3].get('copyright', '')}"
+        print(f"  发布: 《{title}》（正文 {len(note_content)} 字，配图 {'必应每日一图' if bing else '占位图'}）")
+        publish_ok = _publish_note(client, title, note_content, bing_info=bing)
+        if not publish_ok:
+            time.sleep(3)
+            print("  发布: 重试一次 ...")
+            note_content2 = note_content + "\n补充：祝大家周末愉快，把把超神！"
+            publish_ok = _publish_note(client, title, note_content2, bing_info=bing)
 
     # 6) 领取奖励（任务完成后 state 变化，尝试领取所有可领的）
     time.sleep(2)

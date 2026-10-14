@@ -11,7 +11,7 @@
 
 ## 功能特性
 
-- **每日签到** —— 积分签到，连续签到 7 天后每日可得 10 星辉。
+- **每日签到** —— 星辉签到，连续签到 7 天后每日可得 10 星辉。
 - **每日任务全自动** —— 浏览 10 篇 → 点赞 3 篇 → 评论 1 篇 → 分享 1 篇 → 发布 1 篇笔记 → 自动领取全部奖励。
 - **发布内容自动生成** —— 正文取自[一言 API](https://developer.hitokoto.cn/sentence/)（自动拼接保证 ≥ 20 字），配图取自[必应每日一图](https://cn.bing.com/HPImageArchive.aspx?format=js&idx=0&n=1)，上传后随笔记一并发布。
 - **三种登录方式** —— 密码/ 微信扫码（二维码直接渲染在终端）/ 短信验证码。
@@ -169,14 +169,15 @@ sign = Base64( RSA_PKCS1v15_SHA256( hex(MD5(路径含query + JSON请求体)) + �
 
 | 任务   | 接口                                         | 关键字段                                                                                                                                                                                          |
 | ---- | ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 签到   | `POST /user_points/v1/sign_in`             | `{}`                                                                                                                                                                                          |
-| 任务进度 | `GET /task/v1/detail`                      | `taskEveryDay.list[]`：id 9=发布 10=浏览 11=点赞 12=评论 13=分享；state 0=未完成 1=可领取 2=已领取                                                                                                                 |
+| 签到   | `POST /task/v1/signIn`                     | `{}`；成功返回 `data.awardType/awardNum`（星辉），重复签到返回「今日已签到」。⚠️ `/user_points/v1/sign_in` 是空接口，永远返回成功但服务端不记账，签到日历不会更新                                                    |
+| 任务进度 | `GET /task/v1/detail`                      | `signInEveryDay`：连续签到天数 `signInNum`、今日是否已签 `isTodaySignIn`；`taskEveryDay.list[]`：id 9=发布 10=浏览 11=点赞 12=评论 13=分享；state 0=未完成 1=可领取 2=已领取                                                                                                                 |
 | 浏览计数 | `GET /community/v1/detail?momentId=X`      | 逐篇拉取详情才计数（只拉 feed 不算）                                                                                                                                                                         |
 | 笔记列表 | `GET /community/v1/feed?pageSize=N`        | 每页固定返回 20 篇                                                                                                                                                                                   |
 | 点赞   | `POST /community/v1/like`                  | `{momentId, author, like: 1}`（取消点赞为 `like: 2`）                                                                                                                                                |
 | 评论   | `POST /community/v1/moment/comment_commit` | `{momentId, content}`                                                                                                                                                                         |
 | 分享   | `POST /community/v1/share`                 | `{momentId, author}`                                                                                                                                                                          |
-| 发布   | `POST /community/v1/publish`               | `{groupType: "article", title, content(≥20字), resources: [{cover, resource, resourceType: "IMAGE", height, width}]}`；图片先经 `POST /v1/upload/getCommunityImagePreSignUrl` 获取预签名 URL，再 PUT 到 COS |
+| 发布   | `POST /community/v1/publish`               | `{groupType: "article", title, content(≥20字), imageList: [{cover, resource, resourceType: "IMAGE", sourceResource, height, width}]}`。⚠️ 字段名必须是 `imageList`（写成 `resources` 会返回「上传类型错误」）；图片地址必须保留 hostUrl 上的 `?sign=` 签名                                                                                                                                  |
+| 图片上传 | `POST /v1/upload/getCommunityImagePreSignUrl` → `PUT` 到 COS | 请求 `{fileName, contentType}`，响应 `data.url`（COS 预签名地址，3 分钟内有效）与 `data.hostUrl`（CDN 地址，带 `sign` 签名）；把图片 `PUT` 到 `data.url`，发布时提交**完整的** `data.hostUrl` |
 | 领奖   | `POST /task/v1/receive`                    | `{taskId}`；未完成时返回「领取失败」属正常，跳过即可                                                                                                                                                               |
 
 <details><summary>逆向路径（点击展开）</summary>
@@ -213,6 +214,12 @@ token 已过期。重新登录一次即可；若配置了密码登录，`sign` /
 
 **`tasks` 报「未取到笔记 id」？**
 运行 `python oopz_sign.py probe` 查看接口原始响应，确认 `/community/v1/feed` 返回的字段名后再适配。
+
+**签到提示成功，但 App 里签到日历没变化？**
+旧版本的脚本调用了 `/user_points/v1/sign_in`，它是空接口：永远返回 `{"status":true,"data":true}` 但服务端不记账。真实签到接口是 `POST /task/v1/signIn`（当前版本已修正）。可用 `python oopz_sign.py check` 核对「今日已签到 / 连续签到天数」。
+
+**发布笔记报「上传类型错误」？**
+两个原因：① 资源字段名必须是 `imageList`（写成 `resources` / `image_list` 会被忽略）；② 图片地址必须保留 `getCommunityImagePreSignUrl` 返回的 `hostUrl` 上的 `?sign=` 签名，不能只取路径部分。当前版本已修正。
 
 **微信扫码登录后凭证过期怎么办？**
 微信扫码无法无人值守完成，需要重新扫一次；建议改用密码登录实现全自动续期。
